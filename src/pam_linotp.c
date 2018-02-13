@@ -138,19 +138,21 @@ typedef struct {
     int debug;
     int hide_otp_input;
     char * prompt;
+    char * realm_prompt;
     char * tokenlength;
     char * ca_file;
     char * ca_path;
 } LinOTPConfig ;
 
-int pam_linotp_get_authtok(pam_handle_t *pamh, char **password, char ** cleanpassword,
-        const char * prompt, int hide_otp_input, int use_first_pass, size_t *token_length);
+int pam_linotp_get_authtok(pam_handle_t *pamh, char **password, char **cleanpassword,
+        char **realm, const char * password_prompt, const char *realm_prompt,
+        int hide_otp_input, int use_first_pass, size_t* token_length);
 
 int pam_local_get_authtok(pam_handle_t *pamh, int item, char **password,
         char * prompt, int use_first_pass);
 
 int pam_linotp_validate_password(pam_handle_t *pamh,
-        char *user, char *password,
+        char *user, char *password, char *realm,
         LinOTPConfig *config);
 
 int pam_prompt(const pam_handle_t *_pamh, int _style, char **_resp, const char *_fmt, ...);
@@ -516,7 +518,7 @@ cleanup:
     return status;
 }
 /********** LinOTP stuff ***************************/
-int linotp_auth(char *user, char *password,
+int linotp_auth(char *user, char *password, char *realm,
         LinOTPConfig *config, char ** state, char ** challenge,
         char * ca_file, char * ca_path) {
     /**
@@ -554,7 +556,7 @@ int linotp_auth(char *user, char *password,
     curl_easy_setopt(curl_handle, CURLOPT_ERRORBUFFER, errorBuffer);
 
     param = linotp_create_url_params(curl_handle, 5,
-            "realm",   config->realm,
+            "realm",   realm ? realm : config->realm,
             "resConf", config->resConf,
             "user",    user,
             "pass",    password,
@@ -703,6 +705,7 @@ int pam_linotp_get_config(int argc, const char *argv[], LinOTPConfig * config, i
     config->debug = 0;
     config->hide_otp_input = 0;
     config->prompt = strdup(password_prompt);
+    config->realm_prompt = NULL;
     if(!config->prompt) {
         log_error("strdup of password prompt in pam_linotp_get_config failed");
         return (PAM_AUTH_ERR);
@@ -778,13 +781,22 @@ int pam_linotp_get_config(int argc, const char *argv[], LinOTPConfig * config, i
                 config->tokenlength = temp;
             }
         }
-        /* check for prompt */
+        /* check for password prompt */
         else if (check_prefix(argv[i], "prompt=", &temp) > 0) {
             if (strlen(temp) > RESMAXLEN) {
                 log_error("Your prompt definition is to long: %s [%]", argv[i], RESMAXLEN);
                 return (PAM_AUTH_ERR);
             } else {
                 config->prompt = temp;
+            }
+        }
+        /* check for realm prompt */
+        else if (check_prefix(argv[i], "realm_prompt=", &temp) > 0) {
+            if (strlen(temp) > RESMAXLEN) {
+                log_error("Your realm prompt definition is to long: %s [%]", argv[i], RESMAXLEN);
+                return (PAM_AUTH_ERR);
+            } else {
+                config->realm_prompt = temp;
             }
         }
         else {
@@ -829,7 +841,7 @@ int pam_linotp_get_config(int argc, const char *argv[], LinOTPConfig * config, i
  * worker function to make the pam callback smaller ;-)
 ******************************************************/
 int pam_linotp_validate_password(pam_handle_t *pamh,
-        char *user, char *password,
+        char *user, char *password, char *realm,
         LinOTPConfig *config)
 {    /**
      * validate the password against linotp
@@ -851,10 +863,11 @@ int pam_linotp_validate_password(pam_handle_t *pamh,
     char * state = NULL;
     char * challenge  = NULL;
 
-    int ret = linotp_auth(user, password, config, &state, &challenge, config->ca_file, config->ca_path);
+    int ret = linotp_auth(user, password, realm, config, &state, &challenge, config->ca_file, config->ca_path);
     if (ret != PAM_LINO_CHALLENGE){
         erase_string(state);
         erase_string(challenge);
+        erase_string(realm);
         return ret;
     }
 
@@ -868,7 +881,11 @@ int pam_linotp_validate_password(pam_handle_t *pamh,
 
     char * response = NULL;
     char * cleanresponse = NULL;
-    ret = pam_linotp_get_authtok(pamh, &response, &cleanresponse, challenge, config->hide_otp_input, 0, 0);
+    if (realm)
+        erase_string(realm);
+    realm = NULL;
+    ret = pam_linotp_get_authtok(pamh, &response, &cleanresponse, &realm, challenge,
+                                 config->realm_prompt, config->hide_otp_input, 0, 0);
 
     /* now the challenge is done, we can clean the dishes
      * :: challenge is not more required, but state is used as
@@ -880,7 +897,7 @@ int pam_linotp_validate_password(pam_handle_t *pamh,
     if (config->debug)
         log_debug("submitting challenge response: %s ", response);
 
-    ret = linotp_auth(user, response, config, &state, &challenge, config->ca_file, config->ca_path);
+    ret = linotp_auth(user, response, realm, config, &state, &challenge, config->ca_file, config->ca_path);
 
     if (config->debug)
         log_debug("reply to response of challenge >%.10s< state >%.10s< : %d",
@@ -892,6 +909,7 @@ int pam_linotp_validate_password(pam_handle_t *pamh,
     }
     state = erase_string(state);
     response = erase_string(response);
+    erase_string(realm);
 
     log_debug("all memory freed");
 
@@ -1135,7 +1153,9 @@ int pam_linotp_get_authtok_no_use_first_pass(
         pam_handle_t *pamh,
         char **password,
         char **cleanpassword,
-        const char * prompt,
+        char **realm,
+        const char * pw_prompt,
+        const char * r_prompt,
         int hide_otp_input,
         size_t* token_length)
 {
@@ -1152,6 +1172,21 @@ int pam_linotp_get_authtok_no_use_first_pass(
      */
 
     int ret = PAM_AUTHTOK_ERR;
+    if(r_prompt) {
+        /* query for authentication realm */
+        log_debug("Using r_prompt to get auth realm");
+        ret = pam_prompt(pamh, PAM_PROMPT_ECHO_ON, (char **)realm, "%s", r_prompt);
+        if (!realm || ret != PAM_SUCCESS){
+            log_debug("can't get realm");
+            return PAM_AUTHTOK_ERR;
+        }
+        log_debug("realm received successfully %s", *password);
+	if (strlen(*realm) > REALMMAXLEN) {
+            log_debug("realm name too long");
+            erase_string(*realm);
+            return PAM_AUTHTOK_ERR;
+	}
+    }
     /* tokenlength is 0, if there was no configurated token_length,
      * so we cant ask for !(*token_length).
      */
@@ -1161,13 +1196,13 @@ int pam_linotp_get_authtok_no_use_first_pass(
     } else {
         /* Using prompt to ask for password */
         log_debug("Using Prompt to get login data");
-        if (!prompt){
-            prompt = "Your OTP: ";
+        if (!pw_prompt){
+            pw_prompt = password_prompt;
         }
         if(hide_otp_input){
-            ret = pam_prompt(pamh, PAM_PROMPT_ECHO_OFF, (char **)password, "%s", prompt);
+            ret = pam_prompt(pamh, PAM_PROMPT_ECHO_OFF, (char **)password, "%s", pw_prompt);
         } else {
-            ret = pam_prompt(pamh, PAM_PROMPT_ECHO_ON, (char **)password, "%s", prompt);
+            ret = pam_prompt(pamh, PAM_PROMPT_ECHO_ON, (char **)password, "%s", pw_prompt);
         }
         if (!password || ret != PAM_SUCCESS){
             log_debug("cant get password");
@@ -1180,7 +1215,8 @@ int pam_linotp_get_authtok_no_use_first_pass(
 }
 
 int pam_linotp_get_authtok(pam_handle_t *pamh, char **password, char **cleanpassword,
-        const char * prompt, int hide_otp_input, int use_first_pass, size_t* token_length)
+        char **realm, const char * password_prompt, const char *realm_prompt,
+        int hide_otp_input, int use_first_pass, size_t* token_length)
 {
     /** method to get the password from the pam console
      * which hides the use_fist_pass / challange respone differences
@@ -1188,7 +1224,9 @@ int pam_linotp_get_authtok(pam_handle_t *pamh, char **password, char **cleanpass
      * :param pamh: pam handle
      * :param password: reference to the password pointer
      * :param cleanpassword: reference to the cleaned password pointer
-     * :param prompt: what to show to the user
+     * :param realm: reference to the realm pointer
+     * :param password_prompt: what to show to the user for asking the token
+     * :param password_prompt: what to show to the user for asking the realm
      * :param use_first_pass: special case for the apple password catch
      *
      * :return: int success / fail and in the password reference
@@ -1208,7 +1246,9 @@ int pam_linotp_get_authtok(pam_handle_t *pamh, char **password, char **cleanpass
             pamh,
             password,
             cleanpassword,
-            prompt,
+            realm,
+            password_prompt,
+            realm_prompt,
             hide_otp_input,
             token_length);
     }
@@ -1242,6 +1282,7 @@ pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, const char *argv[])
     char *user          = NULL;
     char *password      = NULL;
     char *cleanpassword = NULL;
+    char *realm         = NULL;
     int   ret = PAM_AUTH_ERR;
 
     ret = pam_linotp_get_config(argc, argv, &config, debugflag_pam);
@@ -1282,7 +1323,7 @@ pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, const char *argv[])
     for (i = 0; i < tok.length; i++) {
         log_debug("Getting password");
         size_t token_len = tok.buff[i];
-        ret = pam_linotp_get_authtok(pamh, &password, &cleanpassword, config.prompt, config.hide_otp_input, config.use_first_pass, &token_len);
+        ret = pam_linotp_get_authtok(pamh, &password, &cleanpassword, &realm, config.prompt, config.realm_prompt, config.hide_otp_input, config.use_first_pass, &token_len);
         log_debug("End of password fetching.");
 
         /* validate password */
@@ -1291,7 +1332,7 @@ pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, const char *argv[])
             //ASSERT(cleanpassword != NULL);
             if (password) {  // <- valid auth information
                 /** we got the password, so we will check it against LinOTP **/
-                ret = pam_linotp_validate_password(pamh, user, password, &config);
+                ret = pam_linotp_validate_password(pamh, user, realm, password, &config);
                 log_info("pam_linotp_validate callback done. [%i]", ret);
 
                 if (cleanpassword && *cleanpassword) {
